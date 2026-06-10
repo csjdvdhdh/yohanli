@@ -229,7 +229,7 @@ async def handle_create_service(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    allowed_regions = ['us-central1', 'us-east1', 'us-east4', 'us-west1']
+    allowed_regions = ['us-central1', 'us-central1']
     await query.edit_message_text("⏳ جاري فحص السيرفر المتاح وإنشاء التكوين... انتظر لحظة.")
 
     client        = run_v2.ServicesClient()
