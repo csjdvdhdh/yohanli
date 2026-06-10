@@ -19,25 +19,18 @@ from google.cloud import run_v2
 #  إعدادات البوت
 # ─────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = '8037680515:AAFwYaQ_b0DjxCiWNtnljLfFpeLlDQcDfbg'
-IMAGE_URI           = 'docker.io/seifszx/seifszx'
-ADMIN_ID            = 8650707600        # ← ضع ID التيليغرام الخاص بك
-TOTAL_RAM_GB        = 2.0              # إجمالي الرام المخصص (GB)
-RAM_PER_USER_GB     = 0.2             # حصة كل مستخدم (GB) — عدّلها كما تريد
+IMAGE_URI           = 'docker.io/yohanszx/gcp-vless-bot:latest'
+ADMIN_ID            = 8650707600
+TOTAL_RAM_GB        = 2.0
+RAM_PER_USER_GB     = 0.2
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-# ─────────────────────────────────────────
-#  قاعدة بيانات المستخدمين (في الذاكرة)
-#  { user_id: { "config": "vless://...", "created_at": "..." } }
-# ─────────────────────────────────────────
 users_db: dict = {}
 
-# ─────────────────────────────────────────
-#  GCP Project
-# ─────────────────────────────────────────
 try:
     _, GCP_PROJECT_ID = google.auth.default()
     logging.info(f"تم اكتشاف معرف المشروع: {GCP_PROJECT_ID}")
@@ -47,7 +40,7 @@ except Exception:
 
 
 # ─────────────────────────────────────────
-#  إعداد البيئة تلقائياً
+#  إعداد البيئة
 # ─────────────────────────────────────────
 def setup_environment():
     print("🔧 جاري تثبيت المكتبات...")
@@ -75,11 +68,41 @@ def setup_environment():
 
 
 # ─────────────────────────────────────────
-#  مهمة إرسال إحصائيات RAM كل 15 دقيقة
+#  اكتشاف المناطق المسموحة تلقائياً
+# ─────────────────────────────────────────
+async def get_allowed_regions(project_id: str) -> list:
+    all_regions = [
+        'us-central1', 'us-east1', 'us-east4', 'us-east5',
+        'us-south1', 'us-west1', 'us-west2', 'us-west3', 'us-west4',
+        'europe-west1', 'europe-west2', 'europe-west3', 'europe-west4',
+        'asia-east1', 'asia-northeast1', 'asia-southeast1'
+    ]
+
+    allowed = []
+    client  = run_v2.ServicesClient()
+
+    for region in all_regions:
+        try:
+            parent  = f"projects/{project_id}/locations/{region}"
+            request = run_v2.ListServicesRequest(parent=parent)
+            client.list_services(request=request)
+            allowed.append(region)
+            logging.info(f"✅ منطقة مسموحة: {region}")
+        except Exception as e:
+            if "resourceLocations" in str(e) or "violated" in str(e):
+                logging.info(f"❌ منطقة ممنوعة: {region}")
+            else:
+                allowed.append(region)
+
+    return allowed if allowed else ['us-central1']
+
+
+# ─────────────────────────────────────────
+#  إحصائيات RAM كل 15 دقيقة
 # ─────────────────────────────────────────
 async def ram_stats_job(app: Application):
     while True:
-        await asyncio.sleep(15 * 60)  # 15 دقيقة
+        await asyncio.sleep(15 * 60)
 
         mem        = psutil.virtual_memory()
         used_gb    = mem.used  / (1024 ** 3)
@@ -87,20 +110,18 @@ async def ram_stats_job(app: Application):
         percent    = mem.percent
         user_count = len(users_db)
 
-        # ── رسالة للمسؤول ──
         admin_msg = (
             f"📊 *إحصائيات RAM — {datetime.now().strftime('%H:%M')}*\n\n"
             f"🖥 الإجمالي : `{total_gb:.2f} GB`\n"
             f"🔴 المستخدم : `{used_gb:.2f} GB` ({percent}%)\n"
             f"🟢 المتاح   : `{total_gb - used_gb:.2f} GB`\n"
-            f"👤 عدد المستخدمين النشطين: `{user_count}`"
+            f"👤 عدد المستخدمين: `{user_count}`"
         )
         try:
             await app.bot.send_message(ADMIN_ID, admin_msg, parse_mode="Markdown")
         except Exception as e:
             logging.warning(f"فشل إرسال إحصائيات للمسؤول: {e}")
 
-        # ── رسالة لكل مستخدم بحصته المتبقية ──
         for uid in list(users_db.keys()):
             remaining = max(0.0, RAM_PER_USER_GB - (used_gb / max(user_count, 1)))
             user_msg = (
@@ -125,7 +146,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
 
-    # إذا لديه تكوين سابق أرسله مباشرة
     if user_id in users_db:
         saved = users_db[user_id]
         await update.message.reply_text(
@@ -188,7 +208,7 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────
-#  /reset_user <user_id> — للمسؤول فقط
+#  /reset_user — للمسؤول فقط
 # ─────────────────────────────────────────
 async def reset_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -218,7 +238,6 @@ async def handle_create_service(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
     await query.answer()
 
-    # كل مستخدم له تكوين واحد فقط
     if user_id in users_db:
         saved = users_db[user_id]
         await query.edit_message_text(
@@ -229,8 +248,16 @@ async def handle_create_service(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    allowed_regions = ['us-central1', 'us-central1']
-    await query.edit_message_text("⏳ جاري فحص السيرفر المتاح وإنشاء التكوين... انتظر لحظة.")
+    await query.edit_message_text("⏳ جاري اكتشاف المناطق المتاحة...")
+
+    allowed_regions = await get_allowed_regions(GCP_PROJECT_ID)
+    logging.info(f"المناطق المسموحة: {allowed_regions}")
+
+    await query.edit_message_text(
+        f"✅ تم اكتشاف `{len(allowed_regions)}` منطقة متاحة\n"
+        f"⏳ جاري إنشاء التكوين...",
+        parse_mode="Markdown"
+    )
 
     client        = run_v2.ServicesClient()
     success       = False
@@ -273,20 +300,17 @@ async def handle_create_service(update: Update, context: ContextTypes.DEFAULT_TY
 
             extracted_host = response.uri.replace("https://", "").strip()
 
-            # ── تكوين VLESS ──
             vless_config = (
                 f"vless://ba0e3984-ccc9-48a3-8074-b2f507f41ce8@youtube.com:443"
                 f"?path=%2F@Lw_dz&security=tls&encryption=none"
                 f"&host={extracted_host}&type=ws&sni=youtube.com#Lw_dz-VLESS-WS"
             )
 
-            # حفظ في قاعدة البيانات
             users_db[user_id] = {
                 "config"    : vless_config,
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
             }
 
-            # ── إرسال VLESS فقط ──
             await query.message.reply_text(
                 f"✅ *تم إنشاء التكوين بنجاح!*\n\n"
                 f"🌍 *السيرفر:* `{selected_region}`\n\n"
@@ -295,7 +319,6 @@ async def handle_create_service(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
 
-            # ── إشعار للمسؤول ──
             try:
                 await context.bot.send_message(
                     ADMIN_ID,
@@ -331,13 +354,12 @@ def main():
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("start",       start))
-    application.add_handler(CommandHandler("stats",       stats))
-    application.add_handler(CommandHandler("users",       list_users))
-    application.add_handler(CommandHandler("reset_user",  reset_user))
+    application.add_handler(CommandHandler("start",      start))
+    application.add_handler(CommandHandler("stats",      stats))
+    application.add_handler(CommandHandler("users",      list_users))
+    application.add_handler(CommandHandler("reset_user", reset_user))
     application.add_handler(CallbackQueryHandler(handle_create_service, pattern="create_service"))
 
-    # تشغيل مهمة RAM كل 15 دقيقة
     loop = asyncio.get_event_loop()
     loop.create_task(ram_stats_job(application))
 
