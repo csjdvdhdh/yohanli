@@ -1,0 +1,5 @@
+# requirements.txt
+python-telegram-bot==20.7
+google-cloud-run==0.10.1
+google-auth==2.27.0
+psutil==5.9.8
