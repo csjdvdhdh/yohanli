@@ -7,7 +7,6 @@ import subprocess
 import sys
 import asyncio
 import psutil
-from io import BytesIO
 from datetime import datetime
 
 import google.auth
@@ -68,7 +67,7 @@ def setup_environment():
 
 
 # ─────────────────────────────────────────
-#  اكتشاف المناطق المسموحة تلقائياً
+#  اكتشاف المناطق المسموحة
 # ─────────────────────────────────────────
 async def get_allowed_regions(project_id: str) -> list:
     all_regions = [
@@ -78,21 +77,77 @@ async def get_allowed_regions(project_id: str) -> list:
         'asia-east1', 'asia-northeast1', 'asia-southeast1'
     ]
 
-    allowed = []
+    # ── محاولة 1: قراءة سياسة المنظمة ──
+    try:
+        result = subprocess.run(
+            [
+                "gcloud", "org-policies", "describe",
+                "constraints/gcp.resourceLocations",
+                f"--project={project_id}",
+                "--format=json"
+            ],
+            capture_output=True, text=True, timeout=15
+        )
+
+        if result.returncode == 0:
+            policy = json.loads(result.stdout)
+            allowed_values = (
+                policy.get("spec", {})
+                      .get("rules", [{}])[0]
+                      .get("values", {})
+                      .get("allowedValues", [])
+            )
+            if allowed_values:
+                regions = []
+                for v in allowed_values:
+                    v = v.replace("in:", "").replace("-locations", "")
+                    if v in all_regions:
+                        regions.append(v)
+                if regions:
+                    logging.info(f"✅ مناطق من السياسة: {regions}")
+                    return regions
+
+    except Exception as e:
+        logging.warning(f"فشل قراءة السياسة: {e}")
+
+    # ── محاولة 2: فحص فعلي بإنشاء خدمة تجريبية ──
+    logging.info("جاري الفحص الفعلي للمناطق...")
     client  = run_v2.ServicesClient()
+    allowed = []
 
     for region in all_regions:
         try:
+            service   = run_v2.Service()
+            container = run_v2.Container()
+            container.image = IMAGE_URI
+            service.template.containers = [container]
+
             parent  = f"projects/{project_id}/locations/{region}"
-            request = run_v2.ListServicesRequest(parent=parent)
-            client.list_services(request=request)
+            request = run_v2.CreateServiceRequest(
+                parent=parent,
+                service=service,
+                service_id=f"test-probe-{random.randint(1000, 9999)}"
+            )
+            op       = client.create_service(request=request)
+            response = op.result()
+
+            # احذف الخدمة التجريبية فوراً
+            client.delete_service(
+                request=run_v2.DeleteServiceRequest(name=response.name)
+            )
             allowed.append(region)
             logging.info(f"✅ منطقة مسموحة: {region}")
+            break
+
         except Exception as e:
-            if "resourceLocations" in str(e) or "violated" in str(e):
-                logging.info(f"❌ منطقة ممنوعة: {region}")
+            err = str(e)
+            if "resourceLocations" in err or "violated" in err:
+                logging.info(f"❌ ممنوعة: {region}")
             else:
+                # خطأ آخر يعني المنطقة مسموحة
                 allowed.append(region)
+                logging.info(f"✅ منطقة مسموحة (خطأ آخر): {region}")
+                break
 
     return allowed if allowed else ['us-central1']
 
@@ -133,7 +188,7 @@ async def ram_stats_job(app: Application):
             try:
                 await app.bot.send_message(uid, user_msg, parse_mode="Markdown")
             except Exception as e:
-                logging.warning(f"فشل إرسال إحصائيات للمستخدم {uid}: {e}")
+                logging.warning(f"فشل إرسال للمستخدم {uid}: {e}")
 
 
 # ─────────────────────────────────────────
@@ -268,8 +323,7 @@ async def handle_create_service(update: Update, context: ContextTypes.DEFAULT_TY
         logging.info(f"تجربة المنطقة: {selected_region}")
 
         try:
-            service = run_v2.Service()
-
+            service   = run_v2.Service()
             container = run_v2.Container()
             container.image = IMAGE_URI
             container.resources.limits = {"memory": "2Gi", "cpu": "1"}
